@@ -1,0 +1,842 @@
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 1d6eee30eceb..a2097045e528 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -420,3 +420,11 @@
+ 547	x32	pwritev2		compat_sys_pwritev64v2
+ # This is the end of the legacy x32 range.  Numbers 548 and above are
+ # not special and are not to be used for x32-specific syscalls.
++
++#countdown new added syscall
++1004    common	cd_syscall_difftable	sys_cd_syscall_difftable
++1005    common	cd_syscall_getrecord	sys_cd_syscall_getrecord
++1006	common  cd_syscall_set_current_call    sys_cd_syscall_set_current_call
++1007    common	cd_syscall_syzkaller_switch	sys_cd_syscall_syzkaller_switch
++1008    common	cd_syscall_kernel_start	sys_cd_syscall_kernel_start
++1009    common	cd_syscall_set_pid_executor_id	sys_cd_syscall_set_pid_executor_id
+diff --git a/include/linux/refcount.h b/include/linux/refcount.h
+index a62fcca97486..86408c0decca 100644
+--- a/include/linux/refcount.h
++++ b/include/linux/refcount.h
+@@ -98,6 +98,14 @@
+ #include <linux/limits.h>
+ #include <linux/spinlock_types.h>
+ 
++#include <linux/crc32.h>
++#include <linux/stacktrace.h>
++#include <linux/string.h> 
++#include <linux/vmalloc.h>
++
++#include <linux/spinlock.h>
++#include <linux/hashtable.h>
++
+ struct mutex;
+ 
+ /**
+@@ -112,6 +120,11 @@ typedef struct refcount_struct {
+ 	atomic_t refs;
+ } refcount_t;
+ 
++#define trace_buf_len_cd 2*1024
++
++#define ALLOWED_PROCESS_NUM 4
++#define ALLOWED_SYSCALL_NUM_IN_ONE_PROG 64
++
+ #define REFCOUNT_INIT(n)	{ .refs = ATOMIC_INIT(n), }
+ #define REFCOUNT_MAX		INT_MAX
+ #define REFCOUNT_SATURATED	(INT_MIN / 2)
+@@ -124,7 +137,58 @@ enum refcount_saturation_type {
+ 	REFCOUNT_DEC_LEAK,
+ };
+ 
+-void refcount_warn_saturate(refcount_t *r, enum refcount_saturation_type t);
++
++extern void refcount_warn_saturate(refcount_t *r, enum refcount_saturation_type t);
++
++extern const bool MODIFY_FOR_FUZZING;
++extern const int MAX_AH_NUM_INT;
++
++
++#define INT_NUM_ONE_RECORD 4
++#define MAX_AH_NUM 1024*16*INT_NUM_ONE_RECORD+1 // countdown max 1024 refcount obj for 1 syscall
++// each array corresponds to one executor pid and one syscall idx. 
++// each entry in array corresponds one unique operated [0] refcount obj hash, [1] refcount change, [2] after value, [3] syscall idx in prog
++
++struct res_array {
++	unsigned int ah_l[MAX_AH_NUM];
++	int entry_end;
++};
++
++
++extern const bool logging_switch;
++extern const bool empty_logref;
++
++#define NUM_STACK_ENTRIES 64
++
++#define ALLOWED_IDX_IN_RES_ARRAY 20
++struct cd_index_in_res_array { 
++	unsigned short num_of_idx;
++	unsigned short process_l[ALLOWED_IDX_IN_RES_ARRAY];
++	unsigned short syscall_l[ALLOWED_IDX_IN_RES_ARRAY];
++	unsigned int idx_in_res_array[ALLOWED_IDX_IN_RES_ARRAY];
++};
++
++struct cd_addr_hash_node {
++	unsigned int refcount_addr;
++	unsigned int refcount_hash;
++
++	unsigned short index_in_res_array[ALLOWED_PROCESS_NUM][ALLOWED_SYSCALL_NUM_IN_ONE_PROG];
++    struct hlist_node node;
++};
++
++
++#define NODE_MEMORY_NUM 1024*1024*2 // dynamic memory
++struct node_memory {
++	struct cd_addr_hash_node all_node_l[NODE_MEMORY_NUM];
++	atomic_t cur_new_idx;
++};
++
++struct cd_addr_hash_node* get_a_node_memory(void);
++
++extern unsigned int is_fuzzer_invoked(void);
++
++extern void log_ref(int func_idx, refcount_t *r, unsigned int before_value,
++	     unsigned int after_value, unsigned long long ref_id_num);
+ 
+ /**
+  * refcount_set - set a refcount's value
+@@ -134,8 +198,8 @@ void refcount_warn_saturate(refcount_t *r, enum refcount_saturation_type t);
+ static inline void refcount_set(refcount_t *r, int n)
+ {
+ 	atomic_set(&r->refs, n);
++	log_ref(0, r, n, n, 0); // let delta = 0
+ }
+-
+ /**
+  * refcount_read - get a refcount's value
+  * @r: the refcount
+@@ -185,7 +249,13 @@ static inline __must_check bool __refcount_add_not_zero(int i, refcount_t *r, in
+  */
+ static inline __must_check bool refcount_add_not_zero(int i, refcount_t *r)
+ {
+-	return __refcount_add_not_zero(i, r, NULL);
++
++	unsigned int before_value = arch_atomic_read(&r->refs);
++	bool res = __refcount_add_not_zero(i, r, NULL);
++
++	log_ref(1, r, before_value,
++		res == true ? before_value + i : 0, 0);
++	return res;
+ }
+ 
+ static inline void __refcount_add(int i, refcount_t *r, int *oldp)
+@@ -219,7 +289,10 @@ static inline void __refcount_add(int i, refcount_t *r, int *oldp)
+  */
+ static inline void refcount_add(int i, refcount_t *r)
+ {
++	unsigned int before_value = arch_atomic_read(&r->refs);
++
+ 	__refcount_add(i, r, NULL);
++	log_ref(2, r, before_value, before_value + i, 0);
+ }
+ 
+ static inline __must_check bool __refcount_inc_not_zero(refcount_t *r, int *oldp)
+@@ -242,7 +315,12 @@ static inline __must_check bool __refcount_inc_not_zero(refcount_t *r, int *oldp
+  */
+ static inline __must_check bool refcount_inc_not_zero(refcount_t *r)
+ {
+-	return __refcount_inc_not_zero(r, NULL);
++	unsigned int before_value = arch_atomic_read(&r->refs);
++	bool res = __refcount_inc_not_zero(r, NULL);
++
++	log_ref(3, r, before_value,
++		res == true ? before_value + 1 : 0, 0);
++	return res;
+ }
+ 
+ static inline void __refcount_inc(refcount_t *r, int *oldp)
+@@ -264,7 +342,9 @@ static inline void __refcount_inc(refcount_t *r, int *oldp)
+  */
+ static inline void refcount_inc(refcount_t *r)
+ {
++	unsigned int before_value = arch_atomic_read(&r->refs);
+ 	__refcount_inc(r, NULL);
++	log_ref(4, r, before_value, before_value + 1, 0);
+ }
+ 
+ static inline __must_check bool __refcount_sub_and_test(int i, refcount_t *r, int *oldp)
+@@ -307,7 +387,13 @@ static inline __must_check bool __refcount_sub_and_test(int i, refcount_t *r, in
+  */
+ static inline __must_check bool refcount_sub_and_test(int i, refcount_t *r)
+ {
+-	return __refcount_sub_and_test(i, r, NULL);
++
++	unsigned int before_value = arch_atomic_read(&r->refs);
++	bool res = __refcount_sub_and_test(i, r, NULL);
++
++	log_ref(5, r, before_value,
++		res == true ? 0 : before_value - i, 0);
++	return res;
+ }
+ 
+ static inline __must_check bool __refcount_dec_and_test(refcount_t *r, int *oldp)
+@@ -330,7 +416,16 @@ static inline __must_check bool __refcount_dec_and_test(refcount_t *r, int *oldp
+  */
+ static inline __must_check bool refcount_dec_and_test(refcount_t *r)
+ {
+-	return __refcount_dec_and_test(r, NULL);
++	unsigned int before_value;
++	bool res;
++
++	before_value = arch_atomic_read(&r->refs);
++	res = __refcount_dec_and_test(r, NULL);
++
++	//do not try to read.
++	log_ref(6, r, before_value,
++		res == true ? 0 : before_value - 1, 0);
++	return res;
+ }
+ 
+ static inline void __refcount_dec(refcount_t *r, int *oldp)
+@@ -356,7 +451,11 @@ static inline void __refcount_dec(refcount_t *r, int *oldp)
+  */
+ static inline void refcount_dec(refcount_t *r)
+ {
++	unsigned int before_value;
++	before_value = arch_atomic_read(&r->refs);
++
+ 	__refcount_dec(r, NULL);
++	log_ref(7, r, before_value, before_value - 1, 0);
+ }
+ 
+ extern __must_check bool refcount_dec_if_one(refcount_t *r);
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 77f01ac385f7..240d07a74f2f 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -967,6 +967,18 @@ struct task_struct {
+ 	pid_t				pid;
+ 	pid_t				tgid;
+ 
++	
++	bool fuzzer_invoked; 	
++	bool fuzzer_invoked_rcu;
++
++	struct res_array* used_array;
++	int current_call_idx_in_prog;
++	int executor_id;
++
++	// countdown used for decide which res_array to write. 
++	// all the descendants of one executor should write to the same res_array.
++	
++
+ #ifdef CONFIG_STACKPROTECTOR
+ 	/* Canary value for the -fstack-protector GCC feature: */
+ 	unsigned long			stack_canary;
+diff --git a/init/main.c b/init/main.c
+index 436d73261810..d85af93a4917 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -866,6 +866,46 @@ static void __init print_unknown_bootoptions(void)
+ 	memblock_free(unknown_options, len);
+ }
+ 
++
++extern struct node_memory* p_node_memory_g;
++extern struct res_array** all_res_array; 
++
++void inline alloc_node_memory_once(void) {
++	int i;
++	while(p_node_memory_g == NULL) {
++		p_node_memory_g = (struct node_memory*)vmalloc(sizeof(struct node_memory));
++	}
++	if(p_node_memory_g == NULL) {
++		panic("countdown alloc node memory fail\n");
++	}
++	atomic_set(&p_node_memory_g->cur_new_idx, 0);
++}
++void inline alloc_res_array_once(void) {
++	if(all_res_array == NULL) {
++		all_res_array = (struct res_array**)vmalloc(ALLOWED_PROCESS_NUM * sizeof(struct res_array*));
++		if(all_res_array == NULL) { panic("countdown all_res_array == NULL \n");}
++		int i;
++		for(i = 0; i < ALLOWED_PROCESS_NUM; i++) {
++			all_res_array[i] = NULL;
++			all_res_array[i] = vmalloc(ALLOWED_SYSCALL_NUM_IN_ONE_PROG * sizeof(struct res_array));
++			if(all_res_array[i] == NULL) {
++				panic("all_res_array[i] == NULL\n");
++			}
++		}
++	}
++}
++
++extern spinlock_t cd_logging_locks[];  
++extern unsigned int cd_TABLE_BIT_NUM_INT;
++void inline cd_alloc_my_memory(void) {
++	alloc_node_memory_once();
++	alloc_res_array_once();
++	int i = 0;
++	for(i = 0; i < 1<<(cd_TABLE_BIT_NUM_INT); i ++) {
++		spin_lock_init(&cd_logging_locks[i]);
++	}
++}
++
+ asmlinkage __visible __init __no_sanitize_address __noreturn __no_stack_protector
+ void start_kernel(void)
+ {
+@@ -1064,6 +1104,8 @@ void start_kernel(void)
+ 	arch_post_acpi_subsys_init();
+ 	kcsan_init();
+ 
++	cd_alloc_my_memory();
++
+ 	/* Do the rest non-__init'ed, we're now alive */
+ 	arch_call_rest_init();
+ 
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 3b6d20dfb9a8..f0b8e9b331c4 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -2912,6 +2912,12 @@ pid_t kernel_clone(struct kernel_clone_args *args)
+ 	if (IS_ERR(p))
+ 		return PTR_ERR(p);
+ 
++	p->executor_id = 0xffff;
++	p->current_call_idx_in_prog = 0xffff;
++	p->used_array = NULL;
++	p->fuzzer_invoked = false;
++	p->fuzzer_invoked_rcu = false;
++	
+ 	/*
+ 	 * Do this prior waking up the new thread - the thread pointer
+ 	 * might get invalid after that point, if the thread exits quickly.
+diff --git a/kernel/panic.c b/kernel/panic.c
+index ffa037fa777d..38a28aedfb7d 100644
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -275,6 +275,8 @@ static void panic_other_cpus_shutdown(bool crash_kexec)
+  */
+ void panic(const char *fmt, ...)
+ {
++	current->fuzzer_invoked = false;
++	
+ 	static char buf[1024];
+ 	va_list args;
+ 	long i, i_next = 0, len;
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 2410e3999ebe..08d961ce58cd 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -2885,3 +2885,146 @@ COMPAT_SYSCALL_DEFINE1(sysinfo, struct compat_sysinfo __user *, info)
+ 	return 0;
+ }
+ #endif /* CONFIG_COMPAT */
++
++#include <linux/slab.h>
++#include <linux/refcount.h>
++
++extern struct cd_addr_hash_node* released_ah_l[];
++extern int released_ah_num;
++extern void disable_current_logging(unsigned int* old);
++extern void restore_current_logging(unsigned int* old);
++extern struct res_array** all_res_array;
++extern int allocated_node_num;
++extern bool cd_global_syzkaller_logging_flag[];
++
++
++//1006
++SYSCALL_DEFINE2(cd_syscall_set_current_call, int, executor_id, int, call_idx_in_prog) 
++{
++	if(executor_id >= ALLOWED_PROCESS_NUM) {
++		panic("countdown executor_id > ALLOWED_PROCESS_NUM\n");
++	}
++
++	if(call_idx_in_prog >= ALLOWED_SYSCALL_NUM_IN_ONE_PROG) {
++		panic("call_idx_in_prog > ALLOWED_SYSCALL_NUM_IN_ONE_PROG\n");
++	}
++
++	struct task_struct* current_t = current;
++	current_t->current_call_idx_in_prog = call_idx_in_prog;
++	current_t->executor_id = executor_id;
++	current_t->used_array = &all_res_array[executor_id][call_idx_in_prog];
++	if(current_t->used_array == NULL) {
++		panic("countdown current->used_array == NULL\n");
++	}
++	current_t->used_array->entry_end = 0;
++
++	// set cd_global_syzkaller_logging_flag at end of 1006. 
++	if(cd_global_syzkaller_logging_flag[executor_id]) {
++		current_t->fuzzer_invoked = true; 
++	} else {
++		current_t->fuzzer_invoked = false; 
++	}
++
++	return 0;
++}
++
++
++//1004
++SYSCALL_DEFINE0(cd_syscall_difftable) 
++{
++	current->fuzzer_invoked = false;
++	return 0;
++}
++
++
++//1005
++SYSCALL_DEFINE3(cd_syscall_getrecord, unsigned int*, user_memory, int, executor_id, int, max_call_idx_in_prog) 
++{
++
++	if(executor_id > ALLOWED_PROCESS_NUM) {
++		panic("countdown executor_id > ALLOWED_PROCESS_NUM\n");
++	}
++
++	if(max_call_idx_in_prog >= ALLOWED_SYSCALL_NUM_IN_ONE_PROG) {
++		panic("max_call_idx_in_prog >= ALLOWED_SYSCALL_NUM_IN_ONE_PROG\n");
++	}
++
++	int copied_entry_num = 0;
++	int copied_int_num = 0;
++	
++	int call_idx_in_prog = 0;
++	for(call_idx_in_prog = 0; call_idx_in_prog < max_call_idx_in_prog; call_idx_in_prog++) {
++
++		struct res_array* used_array = &all_res_array[executor_id][call_idx_in_prog];
++		int this_entry_num = used_array->entry_end;
++		if(this_entry_num == 0) {continue;}
++
++		used_array->entry_end = 0; 
++		copied_entry_num += this_entry_num;
++		
++		unsigned int* info_start = &(used_array->ah_l[0]); // source
++		int this_copy_int_num = (this_entry_num*INT_NUM_ONE_RECORD); // num of copied int value
++		int this_copy_byte_num = this_copy_int_num * sizeof(unsigned int);
++
++		if(used_array->ah_l[0] == 0) {
++			panic("countdown hash==0\n");
++		}
++
++		int repeat = 0; 
++		int fail_copy = -1; 
++		while(fail_copy != 0) {
++			fail_copy = copy_to_user(user_memory + copied_int_num, info_start, this_copy_byte_num); // adding 1 means user memory + 4			
++			if(repeat++ > 5) {
++				return 0xffffffffffffffff; 
++			}
++		}
++		
++		copied_int_num += this_copy_int_num;   
++	}
++
++	return copied_entry_num;
++}
++
++
++//1007
++SYSCALL_DEFINE2(cd_syscall_syzkaller_switch, int, do_log, int, executor_id) 
++{
++	unsigned long cd_flags;
++
++	// spin_lock_irqsave(&cd_lock_logging, cd_flags);
++	if(executor_id >= ALLOWED_PROCESS_NUM) { 
++		panic("countdown executor_id > ALLOWED_PROCESS_NUM\n"); 
++	}
++
++	if(do_log>0) {
++		cd_global_syzkaller_logging_flag[executor_id] = true;
++	} else {
++		cd_global_syzkaller_logging_flag[executor_id] = false;
++	}
++
++	// spin_unlock_irqrestore(&cd_lock_logging, cd_flags);
++	return 0;
++}
++
++bool cd_is_booting = true;
++bool is_reproducer = false;
++
++// 1008 disable booting
++SYSCALL_DEFINE0(cd_syscall_kernel_start) 
++{
++	if(cd_is_booting) {
++		cd_is_booting = false;
++	}
++	return 0;
++}
++
++//1009 
++SYSCALL_DEFINE1(cd_syscall_set_pid_executor_id, bool, this_is_reproducer) 
++{
++	if(this_is_reproducer) {
++		is_reproducer = true;
++	} else {
++		is_reproducer = false;
++	}
++	return 0;
++}
+diff --git a/lib/refcount.c b/lib/refcount.c
+index a207a8f22b3c..a68f19319784 100644
+--- a/lib/refcount.c
++++ b/lib/refcount.c
+@@ -7,8 +7,141 @@
+ #include <linux/refcount.h>
+ #include <linux/spinlock.h>
+ #include <linux/bug.h>
++#include <linux/slab.h>
++#include <linux/sched/task.h>
++// #include <linux/crc16.h>
++
++#include <linux/xxhash.h>
++
++#include <linux/mutex.h>
++#include <linux/hashtable.h>
++
++#include <linux/sched/task.h>
++
++
++extern bool cd_is_booting; 
++unsigned int is_fuzzer_invoked(void) { // NEVER CALL PRINTK IN THIS FUNC
++
++	// if(cd_is_booting) return 0x01; // we need to record refcount operations in booting
++	// return 0b11;
++	bool now_in_interrupt = in_interrupt();
++
++	if(now_in_interrupt) {
++		return 0;
++		// if (current->fuzzer_invoked_rcu) {
++		// 	return 0b10;
++		// } else {
++		// 	return 0;
++		// 	// return 0b01; //try to record all to find the missed ones
++		// }	
++	} 
++
++	struct task_struct* current_t = current;
++
++	if(current_t->fuzzer_invoked_rcu) {
++		panic("countdown not in interrupt but fuzzer_invoked_rcu\n");
++	}
++
++	
++	if(current_t->fuzzer_invoked) {
++		return 0b01;
++	}
++	return 0;
++}
++
++void disable_current_logging(unsigned int* old) {
++	*old = is_fuzzer_invoked();
++
++	struct task_struct* current_t = current;
++
++	current_t->fuzzer_invoked_rcu = false;
++	current_t->fuzzer_invoked = false;
++}
++void restore_current_logging(unsigned int* old) {
++	struct task_struct* current_t = current;
++
++	current_t->fuzzer_invoked = (*old)&0b01;
++	current_t->fuzzer_invoked_rcu = (*old)&0b10;
++}
++
++extern void disable_current_logging(unsigned int* old);
++extern void restore_current_logging(unsigned int* old);
++
++struct node_memory* p_node_memory_g = NULL;
++
++#define NODE_MEMORY_BOOTING_NUM 1024*256
++struct cd_addr_hash_node node_memory_for_booting[NODE_MEMORY_BOOTING_NUM];
++atomic_t node_index_for_booting = ATOMIC_INIT(0);
++
++struct cd_addr_hash_node* released_ah_l[0xffff] = {0};
++int released_ah_num = 0;
++
++int allocated_node_num = 0;
++extern bool cd_is_booting;
++
++struct cd_addr_hash_node* get_a_node_memory(void) { //must be called with holding cd_logging_locks
++	
++	int local_node_index_for_booting = arch_atomic_add_return(1, &(node_index_for_booting)) - 1; 
++	
++	if(local_node_index_for_booting < NODE_MEMORY_BOOTING_NUM) {
++		return &node_memory_for_booting[local_node_index_for_booting];
++	}
++
++	if(p_node_memory_g == NULL) {
++		panic("countdown p_node_memory_g == NULL!\n");
++	}
++	int local_node_index_dynamic = atomic_add_return(1, &(p_node_memory_g->cur_new_idx)) - 1;
++	if(local_node_index_dynamic < NODE_MEMORY_NUM) {
++		return &p_node_memory_g->all_node_l[local_node_index_dynamic];
++	}
++
++	panic("countdown pre-allocated memory full!\n");
++	
++	int try_num = 10;
++	struct cd_addr_hash_node* new_node_pointer = NULL;
++	while(try_num-->0 && new_node_pointer == NULL) {
++		new_node_pointer = kmalloc(sizeof(struct cd_addr_hash_node), GFP_NOWAIT);
++	}
++	if(new_node_pointer == NULL) {
++		panic("countdown node memory alloc failed!\n");
++	}
++	allocated_node_num++;
++	return new_node_pointer;
++} 
++
++
++
++const bool MODIFY_FOR_FUZZING = true;
++
++
++const int MAX_AH_NUM_INT = MAX_AH_NUM;
++
++
++// #define RES_ARRAY_NUM ALLOWED_PROCESS_NUM*ALLOWED_SYSCALL_NUM_IN_ONE_PROG 
++// enlarge the mapping to avoid the problem that 
++// one executor starts before the died executor releases the all_res_array
++
++DEFINE_SPINLOCK(cd_lock_all_res_array);
++
++// struct res_array all_res_array[ALLOWED_PROCESS_NUM][ALLOWED_SYSCALL_NUM_IN_ONE_PROG];
++struct res_array** all_res_array = NULL;
++
++#define cd_TABLE_BIT_NUM 20
++const unsigned int cd_TABLE_BIT_NUM_INT = cd_TABLE_BIT_NUM;
++
++DEFINE_HASHTABLE(cd_totalcall_tbl, cd_TABLE_BIT_NUM); //pow(2, N) buckets //*****************
++
++
++bool cd_global_syzkaller_logging_flag[ALLOWED_PROCESS_NUM] = {false}; 
++bool cd_panic_when_full = true;
++
++
++#define REFCOUNT_WARN(str) WARN_ONCE(1, "refcount_t: " str ".\n")
++
++
++
++spinlock_t cd_logging_locks[1<<(cd_TABLE_BIT_NUM)];
+ 
+-#define REFCOUNT_WARN(str)	WARN_ONCE(1, "refcount_t: " str ".\n")
+ 
+ void refcount_warn_saturate(refcount_t *r, enum refcount_saturation_type t)
+ {
+@@ -52,11 +185,17 @@ EXPORT_SYMBOL(refcount_warn_saturate);
+  *
+  * Return: true if the resulting refcount is 0, false otherwise
+  */
++
+ bool refcount_dec_if_one(refcount_t *r)
+ {
++	unsigned int before_value = arch_atomic_read(&r->refs);
++	unsigned long long ref_id_num = 0;//r->ref_id_num;
+ 	int val = 1;
+-
+-	return atomic_try_cmpxchg_release(&r->refs, &val, 0);
++	bool res = atomic_try_cmpxchg_release(&r->refs, &val, 0);
++	unsigned int after_value = res == true ? 0 : before_value;
++	log_ref(8, r, before_value, after_value,
++		ref_id_num);
++	return res;
+ }
+ EXPORT_SYMBOL(refcount_dec_if_one);
+ 
+@@ -73,23 +212,36 @@ EXPORT_SYMBOL(refcount_dec_if_one);
+  */
+ bool refcount_dec_not_one(refcount_t *r)
+ {
+-	unsigned int new, val = atomic_read(&r->refs);
+ 
++	unsigned int before_value = arch_atomic_read(&r->refs);
++	unsigned long long ref_id_num = 0;//r->ref_id_num;
++	unsigned int new, val = atomic_read(&r->refs);
+ 	do {
+-		if (unlikely(val == REFCOUNT_SATURATED))
++		if (unlikely(val == REFCOUNT_SATURATED)) {
++			log_ref(9, r, before_value,
++				before_value - 1, ref_id_num);
+ 			return true;
++		}
+ 
+-		if (val == 1)
++		if (val == 1) {
++			log_ref(9, r, before_value,
++				before_value, ref_id_num);
+ 			return false;
++		}
+ 
+ 		new = val - 1;
+ 		if (new > val) {
+-			WARN_ONCE(new > val, "refcount_t: underflow; use-after-free.\n");
++			WARN_ONCE(new > val,
++				  "refcount_t: underflow; use-after-free.\n");
++			log_ref(9, r, before_value, new,
++				ref_id_num);
+ 			return true;
+ 		}
+ 
+ 	} while (!atomic_try_cmpxchg_release(&r->refs, &val, new));
+ 
++	log_ref(9, r, before_value, before_value - 1,
++		ref_id_num);
+ 	return true;
+ }
+ EXPORT_SYMBOL(refcount_dec_not_one);
+@@ -184,3 +336,157 @@ bool refcount_dec_and_lock_irqsave(refcount_t *r, spinlock_t *lock,
+ 	return true;
+ }
+ EXPORT_SYMBOL(refcount_dec_and_lock_irqsave);
++
++const bool empty_logref = false; 
++extern bool is_reproducer;
++
++void log_ref(int func_idx, refcount_t *r, unsigned int before_value,
++	     unsigned int after_value, unsigned long long ref_id_num) {
++
++	bool logging_b = false;
++	unsigned long cd_flags;
++	char tmp_trace_buf[trace_buf_len_cd] = { 0 };
++	bool refcount_set = false;
++	unsigned long long r_hash = 0;
++	int value_change = after_value - before_value;
++
++	if(empty_logref) {
++		return;
++	}
++
++	if(is_reproducer) {
++		return;
++	}
++
++	unsigned int old_fuzzer_invoke;
++	disable_current_logging(&old_fuzzer_invoke);
++
++	if (func_idx == 0) {
++		unsigned long stack_entries[NUM_STACK_ENTRIES] = { 0 };
++		int num_stack_entries =
++			stack_trace_save(stack_entries, NUM_STACK_ENTRIES, 0);
++
++		refcount_set = true;
++
++		stack_trace_snprint(tmp_trace_buf, trace_buf_len_cd,
++				    &stack_entries[0], num_stack_entries, 1);
++
++		r_hash = xxh32(tmp_trace_buf, strlen(tmp_trace_buf), 0);
++		value_change = after_value;
++	}
++
++	struct task_struct* current_t = current;
++
++	int executor_id = current_t->executor_id;
++
++	logging_b = executor_id != 0xffff // no exucutor_id
++			&& cd_global_syzkaller_logging_flag[executor_id] 
++			&& old_fuzzer_invoke==1 && !cd_is_booting;
++
++	if(!logging_b && !refcount_set) { // nothing to do. finish.
++		restore_current_logging(&old_fuzzer_invoke);
++		return;
++	}
++
++	unsigned int* data_start;
++	unsigned int r_addr = (unsigned long)r & 0xffffffff; //addr
++	unsigned table_entry_num = 1<<(cd_TABLE_BIT_NUM);
++	unsigned int r_bucket_idx = (r_addr/4)%table_entry_num;
++	unsigned int r_lock_idx = r_bucket_idx % table_entry_num; // each entry has a lock
++
++	struct cd_addr_hash_node* tmp_ah = NULL;
++	struct cd_addr_hash_node* this_ah = NULL;
++	bool found_hash_detail_in_map = false;
++
++	spin_lock_irqsave(&cd_logging_locks[r_lock_idx], cd_flags); 
++
++
++	hlist_for_each_entry(tmp_ah, &cd_totalcall_tbl[r_bucket_idx], node) {
++		if (tmp_ah->refcount_addr == r_addr) {
++			found_hash_detail_in_map = true;
++			this_ah = tmp_ah;
++			break;
++		}
++	}
++
++	if(this_ah && after_value == 0) { // remove from table
++		hash_del(&(this_ah->node));
++	}
++
++	if(refcount_set) {
++		if(!found_hash_detail_in_map) {
++			this_ah = get_a_node_memory();
++
++			if(this_ah == NULL) {panic("get no memory for new node!");}
++
++			hlist_add_head(&(this_ah->node), &cd_totalcall_tbl[r_bucket_idx]);
++		}
++
++		this_ah->refcount_addr = r_addr;
++		this_ah->refcount_hash = r_hash;
++
++		int i = 0;
++		for(i = 0; i < ALLOWED_PROCESS_NUM; i++) {
++			int j = 0; 
++			for(j = 0; j < ALLOWED_SYSCALL_NUM_IN_ONE_PROG; j++) {
++				this_ah->index_in_res_array[i][j] = 0xffff; // all the index_in_res_array are initialized
++			}
++		}
++	} else {
++		if(!found_hash_detail_in_map) {
++			// do not record non-set operation if it is not in map. 
++			spin_unlock_irqrestore(&cd_logging_locks[r_lock_idx], cd_flags); 
++			restore_current_logging(&old_fuzzer_invoke);
++			return;
++		}
++	}
++
++	spin_unlock_irqrestore(&cd_logging_locks[r_lock_idx], cd_flags); 
++
++
++	// after this line, tmp_ah should be the hashtable node corresponding to the refcount_addr
++
++	if(logging_b) {
++		struct res_array* used_array = current_t->used_array;
++		int current_call_idx_in_prog = current_t->current_call_idx_in_prog;
++		
++		// only log when logging flag is true. 
++		if(current_t->fuzzer_invoked == true && used_array==NULL) {
++			panic("countdown used array NULL!");
++		}
++		data_start = &(used_array->ah_l[0]);
++
++		// for each refcount operation, check whether its addr was operated in current syscall. 
++		// [1] if the array_index bound to the addr is in the current syscall's scope [0, entry_end)
++		// [2] if the hash matches the hash in res array
++		// If not both conditions are true, current operated addr is new. We insert a new entry to the end of res array.
++		// Otherwise, if the operated addr has been operated in current syscall, we just add the delta on the current record.
++
++		unsigned short idx_in_res_array = this_ah->index_in_res_array[executor_id][current_call_idx_in_prog];
++
++		bool out_scope = idx_in_res_array >= used_array->entry_end;
++		if(out_scope || this_ah->refcount_hash != data_start[idx_in_res_array*INT_NUM_ONE_RECORD]) {
++			//if hash is new to array, point to the end
++			idx_in_res_array = used_array->entry_end;
++			data_start[idx_in_res_array*INT_NUM_ONE_RECORD+1] = 0;
++			
++			(used_array->entry_end)++; // only add entry_end for new addr
++
++			this_ah->index_in_res_array[executor_id][current_call_idx_in_prog] = idx_in_res_array;
++		}
++		
++		if (((idx_in_res_array+1) * INT_NUM_ONE_RECORD) < MAX_AH_NUM_INT) {
++			data_start[idx_in_res_array*INT_NUM_ONE_RECORD+0] = this_ah->refcount_hash;
++			data_start[idx_in_res_array*INT_NUM_ONE_RECORD+1] += value_change;
++			data_start[idx_in_res_array*INT_NUM_ONE_RECORD+2] = after_value;
++			data_start[idx_in_res_array*INT_NUM_ONE_RECORD+3] = current_call_idx_in_prog;
++		} else {
++			if(cd_panic_when_full) {
++				panic("cdcd ah_l buffer is full");
++			}
++		}
++	}
++
++	restore_current_logging(&old_fuzzer_invoke);
++	return;
++}

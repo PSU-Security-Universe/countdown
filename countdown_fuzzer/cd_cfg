@@ -1,0 +1,19 @@
+{
+        "target": "linux/amd64",
+        "http": "127.0.0.1:56741",
+        "workdir": "./workdir",
+        "kernel_obj": "../linux/",
+        "image": "../image/stretch.img",
+        "sshkey": "../image/stretch.id_rsa",
+        "syzkaller": "./",
+        "procs": 4,
+        "type": "qemu",
+        "vm": {
+                "count": 16,
+                "kernel": "../linux/arch/x86/boot/bzImage",
+                "cmdline": "net.ifnames=0",
+                "cpu": 2,
+                "mem": 8192,
+                "qemu_args": "-enable-kvm -smp 2,sockets=2,cores=1 "
+        }
+}
