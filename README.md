@@ -14,4 +14,4 @@ In Proceedings of the 31st ACM Conference on Computer and Communications Securit
 
 ## Acknowledgment
 
-We thank National Science Foundation (NSF) for supporting our work. This research is supported by NSF under grants CNS- 2247652 and CNS-2339848. 
+We thank National Science Foundation (NSF) for supporting our work. This research is supported by NSF under grants CNS-2247652 and CNS-2339848. 
